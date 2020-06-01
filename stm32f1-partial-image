@@ -87,11 +87,6 @@ _cat_help()
     --mask <input_file> [output_file]
         Mask <input_file> and write it [output_file], or otherwise to <stdout>
 
-    --compare <file1> <file2> [<file3> ...]
-        Compare image1.bin to 1 (or more) other binary image files.
-        Print any matched file binary comparison result (or fail) to STDOUT.
-        The input files will first be masked and do not need to be masked beforehand.
-
 
     Options:
 
@@ -253,7 +248,6 @@ _parse_args()
 
                 --view|-v)                  _view=true;;
             	--mask|-m)                  _mask=true ;;
-            	--compare|-c)               _compare=true ;;
 
                 --mcu)         				_arg_mcu=true;;
                 --length)   				_arg_length=true;;
