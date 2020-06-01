@@ -1,0 +1,366 @@
+#!/bin/sh
+
+_program="$(basename $0)"
+
+_pattern_default="0xd00dbeef"
+
+_cwd="$PWD"
+
+
+
+err()
+{
+    _rc="$1"
+    shift
+    echo "${_program}: error: $@"
+    exit $_rc
+}
+
+warn()
+{
+    echo "${_program}: warning: $@"
+}
+
+
+info()
+{
+    echo "${_program}: info: $@"
+}
+
+
+
+_check_dependancies()
+{
+	unset _failed_deps
+
+	for _cmd in "$@"; do
+		if [ ! "$(command -v $_cmd)" ]; then
+		    warn "The required program \"$_cmd\" was not found on your system or anywhere in your \$PATH"
+		    warn"\$PATH=$PATH"
+		    warn "Perhaps \"$_cmd\" can be installed by typing: \"sudo apt install -y $_cmd\" ???"
+		    _failed_deps=true
+		fi
+	done
+
+	if [ "$_failed_deps" ]; then
+		err 1 "Please install missing dependanc(ies) and try again. Exiting."
+	fi
+}
+
+
+
+_cat_help()
+{
+    cat <<- EOF
+
+    $_program:
+
+    Compare partial flash dump taken with the stm32 firmware extractor
+    against full firmware image, by masking the pattern of unknown bytes.
+
+    The onboard flash storage of the STM32F1xx microprocessor must first
+    be dumped over SWD protocol, over openocd, using this other program:
+
+    https://github.com/doegox/stm32f1-firmware-extractor
+    https://blog.zapb.de/stm32f1-exceptional-failure
+
+    Example firmware dump cmd:
+
+        _kilobytes=256; _word_size=4 # 32-bits = 4 bytes
+        ./main.py --value "0xd00dbeef" --binary 0x00 $(echo $_kilobytes*1024/$_word_size | bc) > partial.dump.d00dbeef.first.256kb.bin
+
+
+    Usage:
+
+    $_program [options] --view input.bin
+    $_program [options] --mask input.bin > output.bin
+    $_program [options] --compare image1.bin image2.bin [other image files...]
+
+
+    Commands:
+
+    --view [input_file]
+        View [input_file] in hexdump, replacing the masking [--pattern]
+        (by default its "d00dbeef") with 8 underscores "________".
+        Use <stdin> for binary input, if no [input_file] is specified
+
+    --mask <input_file> [output_file]
+        Mask <input_file> and write it [output_file], or otherwise to <stdout>
+
+    --compare <file1> <file2> [<file3> ...]
+        Compare image1.bin to 1 (or more) other binary image files.
+        Print any matched file binary comparison result (or fail) to STDOUT.
+        The input files will first be masked and do not need to be masked beforehand.
+
+
+    Options:
+
+    --mcu stm32f1
+        Specify a different MCU family. Currently only STM32F1xx series is supported.
+
+    --length N
+        Compare only the first N kilobytes of each masked image. Minimum length 1 KB.
+        Otherwise the shortest length of all the supplied files to compare is chosen.
+
+    --pattern "0xd00dbeef"
+        Use a different masking pattern. Default is "0xd00dbeef"
+
+    --swap-endianness
+        The host machine can be big endian (Intel) or little endian (arm, rpi, ppc)
+        This may affect how the masking pattern is written by the program "bbe"
+        If the masking pattern comes out wrong (bytes swapped), then enable this flag.
+
+    --debug, -d:
+        Enable shell debugging
+
+    --help, -h:
+        Display this message and exit
+
+EOF
+}
+
+
+
+
+_generate_bbe_mask()
+{
+    _byte_order="1-2,3-4,5-6,7-8"
+    _bbe_mask="\x$(echo "${_pattern#0x}" | cut --output-delimiter="\x" -b "$_byte_order")"
+
+    if [ ! "$_swap_endianness" ]; then
+        _bbe_mask="$(echo $_bbe_mask | sed -e "s/\(\\\x..\)\(\\\x..\)\(\\\x..\)\(\\\x..\)/\4\3\2\1/")"
+    fi
+}
+
+
+_check_input_file()
+{
+    if [ -e "$_input_file" ]; then
+        if [ ! -r "$_input_file" ]; then
+            err 1 "Cannot read input file \"$_input_file\". Do you have permissions to read this regular file?"
+        fi
+    else
+        err 1 "Cannot find input file \"$_input_file\". I cannot see it. Does it exist?"
+    fi
+}
+
+_view()
+{
+    if [ "$_input_file" ]; then
+
+        _check_input_file
+        hexdump -v -e '"0x%08.8_ax      "' -e '4/4 "%08x " "\n"' "$_input_file" | sed -e "s/${_pattern#0x}/________/g"
+
+    else
+        # take from <stdin>
+        hexdump -v -e '"0x%08.8_ax      "' -e '4/4 "%08x " "\n"' | sed -e "s/${_pattern#0x}/________/g"
+    fi
+}
+
+
+
+_mask()
+{
+    _check_input_file
+
+    _tmp="$(mktemp --dry-run -t -d $(id -u -n)_stm32-partial-image_XXXXXX)"
+    mkdir -p "$_tmp"
+
+    _tmp_input_file="${_tmp}/$(basename ${_input_file})"
+    cp "$_input_file" "$_tmp_input_file"
+
+
+    if [ "$_output_file" ]; then
+        _tmp_output_file="$(mktemp --dry-run -p "$_tmp" -t $(basename ${_output_file}).XXXXXX)"
+    else
+        _tmp_output_file="$(mktemp --dry-run -p "$_tmp" -t $(basename ${_input_file}).XXXXXX.masked.out)"
+        _stdout=true
+    fi
+
+    # real world example of bbe program on a little endian machine
+    # bbe -b :512 -e "r 0 \xef\xbe\x0d\xd0\xef\xbe\x0d\xd0" g | hexdump -v -e '"0x%08.8_ax      "' -e '4/4 "%08x " "\n"' | sed -e s/d00dbeef/________/g | head -50
+    # bbe -b :512 -e "r 28 \xef\xbe\x0d\xd0\xef\xbe\x0d\xd0\xef\xbe\x0d\xd0\xef\xbe\x0d\xd0" g.1 | hexdump -v -e '"0x%08.8_ax      "' -e '4/4 "%08x " "\n"' | sed -e s/d00dbeef/________/g | head -50
+
+
+
+    # first generate the bbe mask. This is a conversion of the unique --pattern
+    # into a format string which the bbe program can understand \xff\xff etc.
+    _generate_bbe_mask
+
+    # masking pattern repeats every 512 bytes, hence -b :512 flag at the beginning of each command here
+    # next is the offset (starting at 0 being the 1st byte). The number of bytes into the block of 512 bytes
+    # finally the number of "$_bbe_mask" (d00dbeef) patterns to overwrite. Each one is 4 bytes long.
+
+
+    # mask the first 2 words in the block. Starting from byte 0 (offset 0x00)
+    bbe -b :512 -e "r 0 ${_bbe_mask}${_bbe_mask}" "$_tmp_input_file" > "${_tmp_output_file}.1"
+
+    # mask the from the 8th word (4*0x07 = 28th byte) and for the next 4 words until the 11th word inclusive
+    bbe -b :512 -e "r 28 ${_bbe_mask}${_bbe_mask}${_bbe_mask}${_bbe_mask}" "${_tmp_output_file}.1" > "${_tmp_output_file}.2"
+
+    # skip 2 words then mask the 14th word (0x13) only, 4*0x13 = the 52nd byte
+    bbe -b :512 -e "r 52 ${_bbe_mask}" "${_tmp_output_file}.2" > "${_tmp_output_file}.3"
+
+    # mask the 78th word (0x77) only, 4*0x77 = byte address (offset) starting at 0x308
+    bbe -b :512 -e "r 308 ${_bbe_mask}" "${_tmp_output_file}.3" > "${_tmp_output_file}.4"
+
+
+
+    # done masking with intermediate files, rename it
+    mv "${_tmp_output_file}.4" "$_tmp_output_file"    
+
+
+    cd "$_cwd"
+
+    if [ "$_stdout" ]; then
+        cat "$_tmp_output_file"
+        rm -f "$_tmp_output_file"
+
+    else
+        cp "$_tmp_output_file" "$_output_file"    
+    fi
+
+
+    # cleanup tmp folder
+    rm -rf "$_tmp"
+}
+
+
+
+_compare()
+{
+    err 1 "not implemented. exiting."
+}
+
+
+
+_parse_args()
+{
+    unset _arg
+    if [ ! "$1" ]; then
+        _no_args=true
+    fi
+
+    while [ "$1" ]; do
+        _arg="$1"
+
+        if [ "$_send_socket" ]; then
+            _socket_send "$_send_socket" "$@"
+            exit 0
+
+        else
+            case $_arg in
+
+                --view|-v)                  _view=true;;
+            	--mask|-m)                  _mask=true ;;
+            	--compare|-c)               _compare=true ;;
+
+                --mcu)         				_arg_mcu=true;;
+                --length)   				_arg_length=true;;
+				--pattern)          		_arg_pattern=true;;
+                --swap-endianness)          _swap_endianness=true;;
+
+                --debug|-d)                 _debug=true; set -x;;
+                --help|-h)                  _help=true ;;
+
+                *)
+                if [ "$_view" ]; then
+                    _input_file="$_arg"
+
+                elif [ "$_mask" ]; then
+                    _input_file="$_arg"
+
+                    if [ "$2" ]; then
+                        _output_file="$2"
+                        shift
+                    else
+                        _masked_output_to_stdout=true
+                    fi
+
+				elif [ "$_compare" ]; then
+				    _input_file="$_arg"
+				    while [ "$2" ]; do
+				    	if [ "$2" != "${2#--}" ]; then
+				    		break
+				    	fi
+
+				    	if [ "$(echo $2 | grep -E "[[:space:]]")" ]; then
+				    		err 1 "Spaces not permitted in any filenames, when specifying multiple files to compare to."
+				    	fi
+
+				    	# multiple other files
+				    	_compare_files="$_compare_files $2"
+				    	shift
+				    done
+				    unset _arg_compare
+
+                elif [ "$_arg_mcu" ]; then
+                    _mcu="$_arg"
+
+                    if [ "$_mcu" != "stm32f1" ]; then
+                        err 1 "Currently only \"stm32f1\" series is supported."
+                    fi
+
+                elif [ "$_arg_length" ]; then
+                    _length="$_arg"
+
+                elif [ "$_arg_pattern" ]; then
+                    _pattern="$_arg"
+
+                else
+                    warn "unrecognized argument: \"$_arg\""
+                    _cat_help
+                    exit 1
+                fi
+                ;;
+            esac
+        fi
+
+
+        shift
+    done
+
+    if [ ! "$_pattern" ]; then
+        _pattern="$_pattern_default"
+    fi
+
+    if [ "$_help" ] || [ "$_no_args" ]; then
+        _cat_help
+        exit 0
+    fi
+
+    if [ "$_view" ]; then
+        _view
+    fi
+
+    if [ "$_mask" ]; then
+      if [ ! "$_input_file" ]; then
+          err 1 "no input file specified. exiting."
+      fi
+      _mask
+    fi
+
+    if [ "$_compare" ]; then
+    	if [ ! "$_input_file" ]; then
+	    	err 1 "no files specified to compare against. exiting."
+    	fi
+
+	    if [ ! "$_compare_files" ]; then
+	    	err 1 "no files specified to compare \"$_input_file\" to. you must provide 2 or more files"
+	    fi
+
+	    _compare
+	fi
+}
+
+
+# =========================
+# begin:
+
+_check_dependancies id mktemp bc bbe hexdump
+
+_parse_args "$@"
+
+
+
+
